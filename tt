@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+tt — Daily schedule manager with Pomodoro reminders.
+
+Commands:
+  tt [status]   Show current block and Pomodoro state
+  tt start      Start background daemon
+  tt stop       Stop daemon
+  tt restart    Restart daemon
+  tt watch      Live status (refreshes every second)
+  tt pom        One-line Pomodoro status (for Waybar/Polybar)
+  tt log [N]    Show last N log lines (default: 40)
+  tt install    Install systemd user service and start
+  tt daemon     Run daemon in foreground (used by systemd)
+  tt help       Show this help
+"""
+
+import sys, os, time, datetime, subprocess, json, signal, atexit, re
+from pathlib import Path
+
+VERSION = "1.0"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+DATA_DIR   = Path.home() / ".local" / "share" / "tt"
+STATE_FILE = DATA_DIR / "state.json"
+PID_FILE   = DATA_DIR / "tt.pid"
+LOG_FILE   = DATA_DIR / "tt.log"
+
+# ── Schedule ──────────────────────────────────────────────────────────────────
+# (start_hm, end_hm, name, emoji, is_deep_work, work_min, break_min)
+SCHEDULE = [
+    # (start,  end,    name,               emoji, pomodoro, work, break)
+    ("07:30", "08:30", "Breakfast + reading", "🍳", False, 0,  0),
+    ("08:30", "12:00", "Deep Work Block 1",   "🧠", True,  25, 5),
+    ("12:00", "13:30", "Lunch + real break",  "🍜", False, 0,  0),
+    ("13:30", "15:30", "Group work hard cap", "👥", False, 0,  0),
+    ("15:30", "17:00", "Deep Work Block 2",   "🧠", True,  25, 5),
+    ("17:00", "19:00", "Gym / walk",          "🏃", False, 0,  0),
+    ("19:00", "22:00", "Dinner + girlfriend", "💑", False, 0,  0),
+    ("22:00", "23:30", "Wind-down",           "📖", False, 0,  0),
+    ("23:30", "07:30", "Sleep",               "🌙", False, 0,  0),
+]
+CHECK_SECS = 10  # daemon tick interval
+
+# ── ANSI helpers ──────────────────────────────────────────────────────────────
+
+def _a(code, t): return f"\033[{code}m{t}\033[0m"
+def bold(t):     return _a("1",   t)
+def dim(t):      return _a("2",   t)   # still used for subtle text
+def red(t):      return _a("31",  t)   # dark red
+def green(t):    return _a("32",  t)   # dark green
+def yellow(t):   return _a("33",  t)   # dark yellow/brown
+def blue(t):     return _a("34",  t)   # dark blue
+def cyan(t):     return _a("36",  t)   # dark cyan
+def white(t):    return _a("1",   t)   # just bold on light bg
+
+def strip_ansi(s: str) -> str:
+    return re.sub(r'\033\[[^m]*m', '', s)
+
+def col_len(s: str) -> int:
+    """Visual column width (strips ANSI, counts wide chars as 2)."""
+    s = strip_ansi(s)
+    w = 0
+    i = 0
+    while i < len(s):
+        cp = ord(s[i])
+        if cp in (0xFE0F, 0x200D):   # variation selector / ZWJ — zero width
+            i += 1
+            continue
+        if (0x1100 <= cp <= 0x115F or  # Hangul Jamo
+            0x2E80 <= cp <= 0x303F or  # CJK radicals
+            0x3040 <= cp <= 0x33FF or  # Hiragana … CJK compat
+            0x3400 <= cp <= 0x4DBF or  # CJK ext A
+            0x4E00 <= cp <= 0xA4CF or  # CJK unified + Yi
+            0xAC00 <= cp <= 0xD7FF or  # Hangul syllables
+            0xF900 <= cp <= 0xFAFF or  # CJK compat ideographs
+            0xFF01 <= cp <= 0xFF60 or  # Fullwidth
+            0xFFE0 <= cp <= 0xFFE6 or  # Fullwidth signs
+            0x1F300 <= cp <= 0x1FBFF): # Emoji block
+            w += 2
+        else:
+            w += 1
+        i += 1
+    return w
+
+# ── Time helpers ──────────────────────────────────────────────────────────────
+
+def hm2m(hm: str) -> int:
+    h, m = map(int, hm.split(":"))
+    return h * 60 + m
+
+def now_m() -> int:
+    n = datetime.datetime.now()
+    return n.hour * 60 + n.minute
+
+def fmt_rem(minutes: float) -> str:
+    m = int(max(minutes, 0))
+    if m == 0: return "<1m"
+    h, mm = divmod(m, 60)
+    return f"{h}h{mm:02d}m" if h else f"{mm}m"
+
+def pbar(cur: float, total: float, w: int = 20) -> str:
+    r = min(max(cur / max(total, 1), 0), 1)
+    f = int(r * w)
+    return "█" * f + "░" * (w - f)
+
+# ── Schedule helpers ──────────────────────────────────────────────────────────
+
+def get_block(nm: int = None):
+    """Return the schedule entry active at nm (minutes since midnight)."""
+    if nm is None: nm = now_m()
+    for b in SCHEDULE:
+        s, e = hm2m(b[0]), hm2m(b[1])
+        if e < s:                          # spans midnight
+            if nm >= s or nm < e: return b
+        else:
+            if s <= nm < e: return b
+    return None
+
+def blk_rem(b, nm: int = None) -> float:
+    """Minutes remaining in block b at time nm."""
+    if nm is None: nm = now_m()
+    s, e = hm2m(b[0]), hm2m(b[1])
+    if e < s:
+        return float((e + 1440 - nm) if nm >= s else (e - nm))
+    return float(e - nm)
+
+def next_blk(b):
+    return SCHEDULE[(SCHEDULE.index(b) + 1) % len(SCHEDULE)]
+
+# ── State persistence ─────────────────────────────────────────────────────────
+
+def load() -> dict:
+    try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except: return {}
+
+def save(st: dict):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(
+        json.dumps(st, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+# ── Waybar signal ─────────────────────────────────────────────────────────────
+
+WAYBAR_SIGNAL = 8  # SIGRTMIN+8 → waybar re-runs custom/tt immediately
+
+def signal_waybar():
+    try:
+        subprocess.run(
+            ["pkill", f"-RTMIN+{WAYBAR_SIGNAL}", "waybar"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+# ── Notifications & sound ─────────────────────────────────────────────────────
+
+def _dbus_env() -> dict:
+    env = os.environ.copy()
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{os.getuid()}/bus"
+    return env
+
+def notify(title: str, body: str, urgency: str = "normal", ms: int = 8000):
+    try:
+        subprocess.run(
+            ["notify-send", "-u", urgency, "-a", "tt", "-t", str(ms), title, body],
+            env=_dbus_env(), timeout=5, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+    _log(f"[{urgency.upper()}] {title}: {body}")
+
+_SOUNDS = {
+    "work":  "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga",
+    "break": "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    "alert": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+}
+
+def play(kind: str = "work"):
+    path = _SOUNDS.get(kind, _SOUNDS["work"])
+    if not Path(path).exists():
+        return
+    for player in ("pw-play", "paplay", "aplay"):
+        try:
+            subprocess.Popen(
+                [player, path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return
+        except FileNotFoundError:
+            continue
+
+def _log(msg: str):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+# ── Daemon tick ───────────────────────────────────────────────────────────────
+
+def tick():
+    now   = datetime.datetime.now()
+    nm    = now.hour * 60 + now.minute
+    today = now.strftime("%Y-%m-%d")
+    st    = load()
+    b     = get_block(nm)
+    if b is None:
+        return
+
+    name, emoji, deep, wm, bm = b[2], b[3], b[4], b[5], b[6]
+
+    # ── Block transition ──────────────────────────────────────────────────────
+    if st.get("block") != name:
+        st["block"] = name
+        notify(f"{emoji}  {name}", f"时段：{b[0]} – {b[1]}")
+        play("work")
+        if deep:
+            st["pom"] = {
+                "phase": "work",
+                "start": now.isoformat(),
+                "cycle": 1,
+                "wm": wm,
+                "bm": bm,
+            }
+            notify("🍅  番茄钟启动", f"专注 {wm}m → 休息 {bm}m")
+        else:
+            st.pop("pom", None)
+        save(st)
+        signal_waybar()
+
+    # ── Pomodoro state machine ────────────────────────────────────────────────
+    if deep and "pom" in st:
+        p  = st["pom"]
+        el = (now - datetime.datetime.fromisoformat(p["start"])).total_seconds() / 60
+
+        if p["phase"] == "work" and el >= p["wm"]:
+            notify(
+                f"☕  休息 {p['bm']} 分钟！",
+                f"第 {p['cycle']} 个番茄完成，站起来活动一下 🙆",
+                urgency="critical", ms=12000,
+            )
+            play("break")
+            p.update(phase="break", start=now.isoformat())
+            st["pom"] = p
+            save(st)
+            signal_waybar()
+
+        elif p["phase"] == "break" and el >= p["bm"]:
+            p["cycle"] += 1
+            notify(
+                f"🧠  专注开始 — 第 {p['cycle']} 轮",
+                f"专注 {p['wm']} 分钟，保持专注！",
+                urgency="normal", ms=8000,
+            )
+            play("work")
+            p.update(phase="work", start=now.isoformat())
+            st["pom"] = p
+            save(st)
+            signal_waybar()
+
+    # ── Wind-down and sleep reminders ─────────────────────────────────────────
+    if nm == 22 * 60 and st.get("r2200") != today:
+        st["r2200"] = today
+        save(st)
+        notify("📖  Wind-down", "Laptop closed. Light reading or journaling.")
+
+    if nm == 23 * 60 + 30 and st.get("r2330") != today:
+        st["r2330"] = today
+        save(st)
+        notify(
+            "🌙  Bed time",
+            "It is 23:30. Go to bed.",
+            urgency="critical", ms=15000,
+        )
+        play("alert")
+
+# ── Daemon process control ────────────────────────────────────────────────────
+
+def get_pid():
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)   # raises if not alive
+        return pid
+    except Exception:
+        return None
+
+def cmd_daemon():
+    """Foreground daemon — invoked by systemd or cmd_start child."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+    atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    _log(f"Daemon started PID={os.getpid()}")
+    while True:
+        try:
+            tick()
+        except Exception as e:
+            _log(f"ERROR in tick: {e}")
+        time.sleep(CHECK_SECS)
+
+def cmd_start():
+    if get_pid():
+        print(yellow("tt daemon is already running."))
+        return
+    pid = os.fork()
+    if pid > 0:
+        time.sleep(0.4)
+        print(green(f"✓ tt started (PID={pid})"))
+        return
+    # Child process: detach and become daemon
+    os.setsid()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lf = open(LOG_FILE, "a")
+    os.dup2(lf.fileno(), sys.stdout.fileno())
+    os.dup2(lf.fileno(), sys.stderr.fileno())
+    nf = open("/dev/null")
+    os.dup2(nf.fileno(), sys.stdin.fileno())
+    cmd_daemon()
+
+def cmd_stop():
+    pid = get_pid()
+    if not pid:
+        print(yellow("tt daemon is not running."))
+        return
+    os.kill(pid, signal.SIGTERM)
+    print(green(f"✓ tt stopped (PID={pid})"))
+
+def cmd_restart():
+    cmd_stop()
+    time.sleep(0.6)
+    cmd_start()
+
+# ── Status box ────────────────────────────────────────────────────────────────
+
+def render_status() -> str:
+    now = datetime.datetime.now()
+    nm  = now.hour * 60 + now.minute
+    st  = load()
+    b   = get_block(nm)
+    pid = get_pid()
+
+    IW  = 60   # inner box width in visual columns
+    BL  = cyan("│")
+
+    def hline(l="├", r="┤") -> str:
+        return cyan(f"{l}{'─' * IW}{r}")
+
+    def row(content: str = "") -> str:
+        cl  = col_len(content)
+        pad = max(IW - cl, 0)
+        return f"{BL}{content}{' ' * pad}{BL}"
+
+    def vpad(content: str, width: int) -> str:
+        return content + (" " * max(width - col_len(content), 0))
+
+    lines = [hline("╭", "╮")]
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    ts  = yellow(now.strftime("%H:%M:%S"))
+    hdr = f"  {bold(white('tt — 每日时间表'))}    {ts}"
+    lines.append(row(hdr))
+    ds  = green(f"● 守护进程 PID={pid}") if pid else red("○ 未运行 (tt start)")
+    lines.append(row(f"  {ds}"))
+    lines.append(row())
+    lines.append(hline())
+
+    # ── Full schedule ─────────────────────────────────────────────────────────
+    if b:
+        name, emoji, deep, wm, bm = b[2], b[3], b[4], b[5], b[6]
+        rem = blk_rem(b, nm)
+
+        lines.append(row(f"  {bold('今日时间表')}"))
+        for item in SCHEDULE:
+            is_now = item == b
+            marker = bold(green("▶")) if is_now else " "
+            time_range = bold(yellow(f"{item[0]}–{item[1]}"))
+            title_text = f"{item[3]}  {item[2]}"
+            title = vpad(bold(green(title_text)) if is_now else title_text, 24)
+            suffix = f"剩余 {yellow(fmt_rem(rem))}" if is_now else ""
+            line = f"  {marker} {time_range}  {title} {suffix}"
+            lines.append(row(line))
+
+        # ── Pomodoro ──────────────────────────────────────────────────────────
+        if deep and "pom" in st:
+            p  = st["pom"]
+            el = (now - datetime.datetime.fromisoformat(p["start"])).total_seconds() / 60
+
+            lines.append(row())
+            lines.append(hline())
+            lines.append(row(f"  {red('🍅 番茄钟')}   第 {bold(str(p['cycle']))} 轮"))
+
+            if p["phase"] == "work":
+                total = p["wm"]
+                el_c  = min(el, total)
+                bar   = pbar(el_c, total)
+                rem_p = max(total - el, 0)
+                lines.append(row(f"  🧠 专注中  {green(bar)}"))
+                lines.append(row(f"  {fmt_rem(el_c)} / {total}m   剩 {yellow(fmt_rem(rem_p))}"))
+            else:
+                total = p["bm"]
+                el_c  = min(el, total)
+                bar   = pbar(el_c, total)
+                rem_p = max(total - el, 0)
+                lines.append(row(f"  ☕ 休息中  {blue(bar)}"))
+                lines.append(row(f"  {fmt_rem(el_c)} / {total}m   剩 {yellow(fmt_rem(rem_p))}"))
+
+        elif deep:
+            lines.append(row())
+            lines.append(row(dim("  深度工作时段 — 等待守护进程启动番茄钟")))
+    else:
+        lines.append(row(red("  无法确定当前时段")))
+
+    lines.append(hline("╰", "╯"))
+    return "\n".join(lines)
+
+def cmd_status():
+    print(render_status())
+
+def cmd_watch():
+    """Live-refresh status display."""
+    try:
+        while True:
+            sys.stdout.write("\033[2J\033[H")   # clear + home
+            print(render_status())
+            print(dim("\n  按 Ctrl-C 退出"))
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print()
+
+# ── Statusbar one-liner ───────────────────────────────────────────────────────
+
+def cmd_pom():
+    """
+    Single-line Pomodoro output for Waybar / Polybar / i3status.
+    Prints empty string when not in a deep-work block.
+    """
+    now = datetime.datetime.now()
+    st  = load()
+    b   = get_block()
+
+    if b is None or not b[4] or "pom" not in st:
+        print("")
+        return
+
+    p  = st["pom"]
+    el = (now - datetime.datetime.fromisoformat(p["start"])).total_seconds() / 60
+
+    if p["phase"] == "work":
+        rem = max(p["wm"] - el, 0)
+        print(f"🧠 #{p['cycle']} {int(rem)}m")
+    else:
+        rem = max(p["bm"] - el, 0)
+        print(f"☕ #{p['cycle']} {int(rem)}m")
+
+def cmd_bar():
+    """
+    JSON output for Waybar custom module (return-type: json).
+    Always outputs something; CSS class changes by state.
+    Click opens tt watch in a terminal.
+    """
+    now = datetime.datetime.now()
+    nm  = now.hour * 60 + now.minute
+    st  = load()
+    b   = get_block(nm)
+
+    if b is None:
+        print(json.dumps({"text": "", "tooltip": "", "class": "tt-normal"}))
+        return
+
+    name, emoji, deep, wm, bm = b[2], b[3], b[4], b[5], b[6]
+    rem = blk_rem(b, nm)
+    tooltip = f"{emoji} {name}\n{b[0]} – {b[1]}\n剩余 {fmt_rem(rem)}"
+
+    if deep and "pom" in st and st.get("block") == name:
+        p  = st["pom"]
+        el = (now - datetime.datetime.fromisoformat(p["start"])).total_seconds() / 60
+        phase_total = p["wm"] if p["phase"] == "work" else p["bm"]
+        if el <= phase_total:
+            if p["phase"] == "work":
+                ph_rem = max(p["wm"] - el, 0)
+                text   = f"🧠 {int(ph_rem)}m  #{p['cycle']}"
+                tooltip += f"\n\n🍅 专注中 — 第 {p['cycle']} 轮\n还剩 {fmt_rem(ph_rem)} / {p['wm']}m"
+                css    = "tt-work"
+            else:
+                ph_rem = max(p["bm"] - el, 0)
+                text   = f"☕ {int(ph_rem)}m  #{p['cycle']}"
+                tooltip += f"\n\n🍅 休息中 — 第 {p['cycle']} 轮\n还剩 {fmt_rem(ph_rem)} / {p['bm']}m"
+                css    = "tt-break"
+        else:
+            text = f"🧠 {fmt_rem(rem)}"
+            css  = "tt-work"
+    elif deep:
+        # Deep work but daemon not yet initialized pom state
+        text    = f"🧠 {fmt_rem(rem)}"
+        css     = "tt-work"
+    else:
+        text    = f"{emoji} {fmt_rem(rem)}"
+        css     = "tt-normal"
+
+    print(json.dumps({"text": text, "tooltip": tooltip, "class": css}, ensure_ascii=False))
+
+# ── Log viewer ────────────────────────────────────────────────────────────────
+
+def cmd_log(n: int = 40):
+    if not LOG_FILE.exists():
+        print(dim("日志为空。"))
+        return
+    lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
+    print(dim(f"  — 最近 {min(n, len(lines))} 条日志 ({LOG_FILE}) —"))
+    for ln in lines[-n:]:
+        if "[CRITICAL]" in ln:
+            print(red(ln))
+        elif "ERROR" in ln:
+            print(yellow(ln))
+        else:
+            print(dim(ln))
+
+# ── Systemd user service install ──────────────────────────────────────────────
+
+_SERVICE = """\
+[Unit]
+Description=tt — Daily schedule and Pomodoro manager
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={path} daemon
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+def cmd_install():
+    svc_dir = Path.home() / ".config" / "systemd" / "user"
+    svc_dir.mkdir(parents=True, exist_ok=True)
+    svc = svc_dir / "tt.service"
+    svc.write_text(_SERVICE.format(path=Path(__file__).resolve()))
+    print(green("✓ ") + f"Service file: {svc}")
+
+    for args in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "tt"],
+    ):
+        r = subprocess.run(args, capture_output=True)
+        label = " ".join(args)
+        if r.returncode == 0:
+            print(green("✓ ") + label)
+        else:
+            print(red("✗ ") + label)
+            if r.stderr:
+                print(dim("  " + r.stderr.decode().strip()))
+
+    pid = get_pid()
+    if pid:
+        print(green(f"\n✓ tt is running (PID={pid}). 现在会收到时段通知！"))
+    else:
+        print(yellow("\n  服务可能需要图形会话才能自动启动。手动运行: tt start"))
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+
+_HELP = f"""\
+
+  {cyan(bold('tt'))}  v{VERSION} — 每日时间表 + 番茄钟守护进程
+
+  {bold('命令')}
+    {cyan('tt')}            当前时段 + 番茄钟状态
+    {cyan('tt start')}      启动后台守护进程
+    {cyan('tt stop')}       停止守护进程
+    {cyan('tt restart')}    重启守护进程
+    {cyan('tt watch')}      实时刷新状态（每秒）
+    {cyan('tt pom')}        单行番茄钟输出（适合 Waybar/Polybar）
+    {cyan('tt log')} [N]    显示最近 N 条日志（默认 40）
+    {cyan('tt install')}    安装 systemd 用户服务并立即启动
+    {cyan('tt daemon')}     前台运行守护进程（由 systemd 调用）
+    {cyan('tt help')}       显示此帮助
+
+  {bold('时间表')}
+    08:30–12:00  Deep Work Block 1  🧠  Pomodoro 25m focus + 5m break
+    15:30–17:00  Deep Work Block 2  🧠  Pomodoro 25m focus + 5m break
+    22:00        📖  Wind-down reminder
+    23:30        🌙  Bed reminder
+
+  {bold('状态栏集成')}  (Waybar exec 字段)
+    "exec": "tt bar"
+    "return-type": "json"
+    "interval": 30
+
+  {bold('数据目录')}  ~/.local/share/tt/
+"""
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    cmd  = args[0] if args else "status"
+
+    dispatch = {
+        "status":  lambda: cmd_status(),
+        "s":       lambda: cmd_status(),
+        "start":   lambda: cmd_start(),
+        "stop":    lambda: cmd_stop(),
+        "restart": lambda: cmd_restart(),
+        "watch":   lambda: cmd_watch(),
+        "w":       lambda: cmd_watch(),
+        "pom":     lambda: cmd_pom(),
+        "bar":     lambda: cmd_bar(),
+        "log":     lambda: cmd_log(int(args[1]) if len(args) > 1 else 40),
+        "install": lambda: cmd_install(),
+        "daemon":  lambda: cmd_daemon(),
+        "help":    lambda: print(_HELP),
+        "-h":      lambda: print(_HELP),
+        "--help":  lambda: print(_HELP),
+    }
+
+    fn = dispatch.get(cmd)
+    if fn:
+        fn()
+    else:
+        print(red(f"未知命令: {cmd}"))
+        print(_HELP)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
